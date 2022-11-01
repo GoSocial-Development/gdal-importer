@@ -12,17 +12,6 @@ use std::time::Instant;
 use tokio_postgres::tls::NoTlsStream;
 use tokio_postgres::{Client, Connection, Error, NoTls, Socket};
 
-fn process_resume(string: &str) -> HashMap<String, i64> {
-    let mut resume: HashMap<String, i64> = HashMap::new();
-    for entry in string.split("|") {
-        let split = entry.split(":").collect::<Vec<&str>>();
-        if split.len() > 1 {
-            resume.insert(split[0].to_string(), split[1].parse::<i64>().unwrap());
-        }
-    }
-    resume
-}
-
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -33,7 +22,11 @@ async fn main() {
     let ini = Ini::load_from_file(ini_path).unwrap();
     let config: &Properties = ini.section(Some("CONFIG")).unwrap();
 
-    let resume = process_resume(config.get("RESUME").unwrap());
+    let mut resume = false;
+
+    if config.get("RESUME").unwrap_or("false") == "true" {
+        resume = true;
+    }
 
     let es_auth: HashMap<String, String> = get_elastic_auth(config);
 
@@ -90,12 +83,33 @@ async fn main() {
 
         let layer_name = layer.name();
 
-        let layer_resume = match resume.get(&layer_name) {
-            Some(v) => v,
-            None => &0,
-        };
+        let mut insert_count = HashMap::new();
+        if resume {
+            let psql_rows = match psql_rows(&client, &layer_name.to_lowercase()).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    println!("Error grabbing ES nr of inserted rows: {}", e);
+                    process::exit(1);
+                }
+            };
+            insert_count.insert("psql", psql_rows);
+            let es_rows = match es_rows(
+                &config.get("ELASTIC_HOST").unwrap(),
+                &layer_name.to_lowercase(),
+                &es_auth,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    println!("Error grabbing ES nr of inserted rows: {}", e);
+                    process::exit(1);
+                }
+            };
+            insert_count.insert("es", es_rows);
+        }
 
-        if layer_resume == &0 {
+        if !resume {
             match create_elastic_index(
                 &mapping,
                 config.get("ELASTIC_HOST").unwrap(),
@@ -123,30 +137,56 @@ async fn main() {
         let mut chunk: Vec<Feature> = Vec::new();
         let mut iterations = 0;
 
+        let mut es_skip = false;
+        let mut psql_skip = false;
+
         for mut feature in layer.features() {
             if geometry_tolerance > 0 as f64 {
                 feature
-                    .set_geometry(feature.geometry().simplify(geometry_tolerance).unwrap())
+                    .set_geometry(
+                        feature
+                            .geometry()
+                            .simplify_preserve_topology(geometry_tolerance)
+                            .unwrap(),
+                    )
                     .unwrap();
             }
             chunk.push(feature);
             if chunk.len() == chunk_size as usize {
                 iterations = iterations + 1;
 
-                if layer_resume > &0 && layer_resume >= &((iterations * chunk_size) as i64) {
-                    chunk = Vec::new();
-                    continue;
+                if resume && insert_count.get("es").unwrap() >= &((iterations * chunk_size) as i64)
+                {
+                    es_skip = true;
+                } else {
+                    es_skip = false;
                 }
+
+                if resume
+                    && insert_count.get("psql").unwrap() >= &((iterations * chunk_size) as i64)
+                {
+                    psql_skip = true;
+                } else {
+                    psql_skip = false;
+                }
+
                 let start = Instant::now();
 
                 match tokio::try_join!(
-                    psql_insert(&client, &chunk, &mapping, layer_name.to_lowercase()),
+                    psql_insert(
+                        &client,
+                        &chunk,
+                        &mapping,
+                        layer_name.to_lowercase(),
+                        psql_skip
+                    ),
                     elastic_insert(
                         &chunk,
                         &mapping,
                         config.get("ELASTIC_HOST").unwrap(),
                         layer_name.to_lowercase(),
                         &es_auth,
+                        es_skip
                     )
                 ) {
                     Ok((_psql, _es)) => {
@@ -175,8 +215,15 @@ async fn main() {
                     config.get("ELASTIC_HOST").unwrap(),
                     layer_name.to_lowercase(),
                     &es_auth,
+                    es_skip
                 ),
-                psql_insert(&client, &chunk, &mapping, layer_name.to_lowercase())
+                psql_insert(
+                    &client,
+                    &chunk,
+                    &mapping,
+                    layer_name.to_lowercase(),
+                    psql_skip
+                )
             ) {
                 Ok((_psql, _es)) => {
                     // do something with the values
@@ -261,7 +308,11 @@ async fn psql_insert(
     features: &Vec<Feature<'_>>,
     mapping: &HashMap<String, String>,
     table: String,
+    skip: bool,
 ) -> Result<bool, anyhow::Error> {
+    if skip {
+        return Ok(true);
+    }
     let mut insert_query = Vec::new();
 
     insert_query.push(["INSERT INTO", &table, "("].join(" "));
@@ -386,7 +437,11 @@ async fn elastic_insert(
     es_host: &str,
     index: String,
     auth: &HashMap<String, String>,
+    skip: bool,
 ) -> Result<bool, anyhow::Error> {
+    if skip {
+        return Ok(true);
+    }
     let body: Vec<String> = process_rows(features, mapping, &index);
 
     let client = reqwest::Client::new();
