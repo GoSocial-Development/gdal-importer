@@ -59,7 +59,13 @@ async fn main() {
             process::exit(1);
         }
     };
-    let dataset = Dataset::open(Path::new(gdb_path)).unwrap();
+    let dataset = match Dataset::open(Path::new(gdb_path)) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("Error opening dataset {}", e);
+            process::exit(1);
+        }
+    };
     let nr_of_layers = dataset.layer_count();
 
     println!("Found {} layers", nr_of_layers);
@@ -107,6 +113,11 @@ async fn main() {
                 }
             };
             insert_count.insert("es", es_rows);
+            println!(
+                "Resuming with ES: {}; PSQL: {}",
+                insert_count.get("es").unwrap(),
+                insert_count.get("psql").unwrap()
+            );
         }
 
         if !resume {
@@ -140,17 +151,7 @@ async fn main() {
         let mut es_skip = false;
         let mut psql_skip = false;
 
-        for mut feature in layer.features() {
-            if geometry_tolerance > 0 as f64 {
-                feature
-                    .set_geometry(
-                        feature
-                            .geometry()
-                            .simplify_preserve_topology(geometry_tolerance)
-                            .unwrap(),
-                    )
-                    .unwrap();
-            }
+        for feature in layer.features() {
             chunk.push(feature);
             if chunk.len() == chunk_size as usize {
                 iterations = iterations + 1;
@@ -172,58 +173,64 @@ async fn main() {
 
                 let start = Instant::now();
 
-                match tokio::try_join!(
-                    psql_insert(
-                        &client,
-                        &chunk,
+                if !es_skip && !psql_skip {
+                    let data = process_chunk(
+                        chunk,
                         &mapping,
                         layer_name.to_lowercase(),
-                        psql_skip
-                    ),
-                    elastic_insert(
-                        &chunk,
-                        &mapping,
-                        config.get("ELASTIC_HOST").unwrap(),
-                        layer_name.to_lowercase(),
-                        &es_auth,
-                        es_skip
-                    )
-                ) {
-                    Ok((_psql, _es)) => {
-                        // do something with the values
-                    }
-                    Err(err) => {
-                        println!("processing failed; error = {}", err);
-                        process::exit(0);
-                    }
-                };
-                let remaining_nr_rows = feature_count - (chunk.len() as u64 * iterations as u64);
-                let time_per_row = (start.elapsed().as_millis() as f64) / chunk.len() as f64;
-                let time_remaining = remaining_nr_rows as f64 * time_per_row / 60000 as f64;
+                        geometry_tolerance,
+                    );
+                    match tokio::try_join!(
+                        psql_insert(&client, &data.1, psql_skip),
+                        elastic_insert(
+                            data.0,
+                            config.get("ELASTIC_HOST").unwrap(),
+                            &es_auth,
+                            es_skip
+                        )
+                    ) {
+                        Ok((_psql, _es)) => {
+                            // do something with the values
+                        }
+                        Err(err) => {
+                            println!("processing failed; error = {}", err);
+                            process::exit(0);
+                        }
+                    };
+                }
+
+                let remaining_nr_rows = feature_count - (chunk_size as u64 * iterations as u64);
+                let time_per_row = (start.elapsed().as_millis() as f64) / chunk_size as f64;
+                let time_remaining = remaining_nr_rows as f64 * time_per_row / 3600000 as f64;
                 print!("\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}");
-                print!("ETA: {:.0?} minutes", time_remaining);
+
+                if es_skip && psql_skip {
+                    print!("Skipped {}", iterations * chunk_size);
+                } else if time_remaining < 1.0 {
+                    print!("ETA: {:.0?} minutes", time_remaining / 60.0);
+                } else {
+                    print!("ETA: {:.1?} hours", time_remaining);
+                }
                 io::stdout().flush().unwrap();
                 chunk = Vec::new();
             }
         }
 
         if chunk.len() > 0 {
+            let data = process_chunk(
+                chunk,
+                &mapping,
+                layer_name.to_lowercase(),
+                geometry_tolerance,
+            );
             match tokio::try_join!(
                 elastic_insert(
-                    &chunk,
-                    &mapping,
+                    data.0,
                     config.get("ELASTIC_HOST").unwrap(),
-                    layer_name.to_lowercase(),
                     &es_auth,
                     es_skip
                 ),
-                psql_insert(
-                    &client,
-                    &chunk,
-                    &mapping,
-                    layer_name.to_lowercase(),
-                    psql_skip
-                )
+                psql_insert(&client, &data.1, psql_skip)
             ) {
                 Ok((_psql, _es)) => {
                     // do something with the values
@@ -262,6 +269,150 @@ async fn main() {
 
         index = index + 1;
     }
+}
+
+fn process_chunk(
+    features: Vec<Feature<'_>>,
+    mapping: &HashMap<String, String>,
+    table: String,
+    geometry_tolerance: f64,
+) -> (String, String) {
+    let mut body: Vec<String> = Vec::new();
+
+    let mut es_row = json!({});
+
+    let mut insert_query = Vec::new();
+
+    insert_query.push(["INSERT INTO", &table, "("].join(" "));
+
+    insert_query.push(
+        mapping
+            .keys()
+            .map(|k| k.to_string())
+            .collect::<Vec<String>>()
+            .join(","),
+    );
+    insert_query.push(",objectid, the_geom) VALUES ".to_string());
+
+    let mut insert_values = Vec::new();
+
+    for mut feature in features {
+        if geometry_tolerance > 0 as f64 {
+            feature
+                .set_geometry(
+                    feature
+                        .geometry()
+                        .simplify_preserve_topology(geometry_tolerance)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        body.push(
+            [
+                json!({"index": {
+                    "_index": table,
+                    "_type": "data"
+                }})
+                .to_string(),
+                "\n".to_string(),
+            ]
+            .join(""),
+        );
+        let mut values: Vec<String> = Vec::new();
+        insert_values.push("(".to_string());
+
+        for (key, _value) in mapping {
+            match feature.field(key).unwrap() {
+                Some(value) => match value {
+                    FieldValue::Integer64Value(v) => {
+                        es_row[key.to_lowercase()] = Value::from(v);
+                        values.push(v.to_string())
+                    }
+                    FieldValue::DateTimeValue(v) => {
+                        let val = v.format("%Y-%m-%d").to_string();
+                        es_row[key.to_lowercase()] = Value::from(val.clone());
+                        values.push(["'", &val.clone(), "'"].join(""));
+                    }
+                    FieldValue::IntegerValue(v) => {
+                        es_row[key.to_lowercase()] = Value::from(v.clone());
+                        values.push(v.to_string())
+                    }
+                    FieldValue::IntegerListValue(v) => {
+                        let val = v
+                            .into_iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>()
+                            .join("");
+                        es_row[key.to_lowercase()] = Value::from(val.clone());
+                        values.push(val.clone())
+                    }
+                    FieldValue::Integer64ListValue(v) => {
+                        let val = v
+                            .into_iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>()
+                            .join("");
+                        es_row[key.to_lowercase()] = Value::from(val.clone());
+                        values.push(val.clone());
+                    }
+                    FieldValue::StringValue(v) => {
+                        es_row[key.to_lowercase()] = Value::from(v.clone());
+                        values.push(["'", &v.replace("'", "''"), "'"].join(""))
+                    }
+                    FieldValue::StringListValue(v) => {
+                        let val = v.into_iter().map(|v| v).collect::<Vec<String>>().join("");
+                        es_row[key.to_lowercase()] = Value::from(val.clone());
+                        values.push(val.clone());
+                    }
+                    FieldValue::RealValue(v) => {
+                        es_row[key.to_lowercase()] = Value::from(v);
+                        values.push(v.to_string())
+                    }
+                    FieldValue::RealListValue(v) => {
+                        let val = v
+                            .into_iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>()
+                            .join("");
+                        es_row[key.to_lowercase()] = Value::from(val.clone());
+                        values.push(val.clone());
+                    }
+                    FieldValue::DateValue(v) => {
+                        es_row[key.to_lowercase()] = Value::from(v.to_string());
+                        values.push(["'", &v.to_string(), "'"].join(""))
+                    }
+                },
+                None => values.push(String::from("NULL")),
+            };
+        }
+        values.push(feature.fid().unwrap().to_string());
+        values.push(
+            [
+                "st_geomfromtext('",
+                &feature.geometry().wkt().unwrap(),
+                "',4326)",
+            ]
+            .join(""),
+        );
+
+        es_row["objectid"] = Value::from(feature.fid().unwrap());
+        es_row["the_geom"] =
+            serde_json::from_str(&feature.geometry().json().unwrap().replace("\\\"", "\""))
+                .unwrap();
+
+        body.push([json!(es_row).to_string(), "\n".to_string()].join(""));
+
+        insert_values.push(values.join(","));
+        insert_values.push("),".to_string());
+    }
+
+    insert_query
+        .push(insert_values.join("").to_string()[0..insert_values.join("").len() - 1].to_string());
+
+    (
+        [body.join(""), "\n".to_string()].join(""),
+        insert_query.join(" "),
+    )
 }
 
 async fn psql_rows(client: &Client, table: &str) -> Result<i64, Error> {
@@ -303,90 +454,11 @@ async fn es_rows(
     }
 }
 
-async fn psql_insert(
-    client: &Client,
-    features: &Vec<Feature<'_>>,
-    mapping: &HashMap<String, String>,
-    table: String,
-    skip: bool,
-) -> Result<bool, anyhow::Error> {
+async fn psql_insert(client: &Client, query: &str, skip: bool) -> Result<bool, anyhow::Error> {
     if skip {
         return Ok(true);
     }
-    let mut insert_query = Vec::new();
-
-    insert_query.push(["INSERT INTO", &table, "("].join(" "));
-
-    insert_query.push(
-        mapping
-            .keys()
-            .map(|k| k.to_string())
-            .collect::<Vec<String>>()
-            .join(","),
-    );
-    insert_query.push(",objectid, the_geom) VALUES ".to_string());
-
-    let mut insert_values = Vec::new();
-
-    for feature in features {
-        let mut values: Vec<String> = Vec::new();
-        insert_values.push("(".to_string());
-
-        for (key, _value) in mapping {
-            match feature.field(key).unwrap() {
-                Some(value) => match value {
-                    FieldValue::Integer64Value(v) => values.push(v.to_string()),
-                    FieldValue::DateTimeValue(v) => {
-                        values.push(["'", &v.format("%Y-%m-%d").to_string(), "'"].join(""))
-                    }
-                    FieldValue::IntegerValue(v) => values.push(v.to_string()),
-                    FieldValue::IntegerListValue(v) => values.push(
-                        v.into_iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<String>>()
-                            .join(""),
-                    ),
-                    FieldValue::Integer64ListValue(v) => values.push(
-                        v.into_iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<String>>()
-                            .join(""),
-                    ),
-                    FieldValue::StringValue(v) => {
-                        values.push(["'", &v.replace("'", "''"), "'"].join(""))
-                    }
-                    FieldValue::StringListValue(v) => {
-                        values.push(v.into_iter().map(|v| v).collect::<Vec<String>>().join(""))
-                    }
-                    FieldValue::RealValue(v) => values.push(v.to_string()),
-                    FieldValue::RealListValue(v) => values.push(
-                        v.into_iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<String>>()
-                            .join(""),
-                    ),
-                    FieldValue::DateValue(v) => values.push(["'", &v.to_string(), "'"].join("")),
-                },
-                None => values.push(String::from("NULL")),
-            };
-        }
-        values.push(feature.fid().unwrap().to_string());
-        values.push(
-            [
-                "st_geomfromtext('",
-                &feature.geometry().wkt().unwrap(),
-                "',4326)",
-            ]
-            .join(""),
-        );
-        insert_values.push(values.join(","));
-        insert_values.push("),".to_string());
-    }
-
-    insert_query
-        .push(insert_values.join("").to_string()[0..insert_values.join("").len() - 1].to_string());
-
-    match client.execute(&insert_query.join(" "), &[]).await {
+    match client.execute(query, &[]).await {
         Ok(_) => Ok(true),
         Err(e) => Err(anyhow::anyhow!(e)),
     }
@@ -432,22 +504,18 @@ async fn create_psql_table(
 }
 
 async fn elastic_insert(
-    features: &Vec<Feature<'_>>,
-    mapping: &HashMap<String, String>,
+    body: String,
     es_host: &str,
-    index: String,
     auth: &HashMap<String, String>,
     skip: bool,
 ) -> Result<bool, anyhow::Error> {
     if skip {
         return Ok(true);
-    }
-    let body: Vec<String> = process_rows(features, mapping, &index);
-
+    };
     let client = reqwest::Client::new();
     match client
         .put([es_host, "/_bulk?wait_for_active_shards=0"].join(""))
-        .body([body.join(""), "\n".to_string()].join(""))
+        .body(body)
         .basic_auth(
             auth.get("username").unwrap_or(&"".to_string()),
             Some(auth.get("password").unwrap_or(&"".to_string())),
@@ -493,88 +561,6 @@ async fn elastic_insert(
         reqwest::Result::Err(e) => Err(anyhow::anyhow!("Request Error {}", e)),
     }
 }
-
-fn process_rows(
-    features: &Vec<Feature>,
-    mapping: &HashMap<String, String>,
-    index: &str,
-) -> Vec<String> {
-    let mut body: Vec<String> = Vec::new();
-    for feature in features {
-        let mut es_row = json!({});
-        body.push(
-            [
-                json!({"index": {
-                    "_index": index,
-                    "_type": "data"
-                }})
-                .to_string(),
-                "\n".to_string(),
-            ]
-            .join(""),
-        );
-        for e in feature.fields() {
-            let mut ignore_value = false;
-            let value = match e.1 {
-                Some(v) => {
-                    let field_type = mapping.get(&e.0).unwrap();
-                    if field_type == "string" {
-                        match v.into_string() {
-                            Some(v) => Value::from(v),
-                            None => {
-                                ignore_value = true;
-                                Value::from("")
-                            }
-                        }
-                    } else if field_type == "integer" {
-                        match v.into_int64() {
-                            Some(v) => Value::from(v),
-                            None => {
-                                ignore_value = true;
-                                Value::from("")
-                            }
-                        }
-                    } else if field_type == "double" {
-                        match v.into_real() {
-                            Some(v) => Value::from(v),
-                            None => {
-                                ignore_value = true;
-                                Value::from("")
-                            }
-                        }
-                    } else if field_type == "date" {
-                        match v.into_date() {
-                            Some(v) => Value::from(v.format("%Y-%m-%d").to_string()),
-                            None => {
-                                ignore_value = true;
-                                Value::from("")
-                            }
-                        }
-                    } else {
-                        ignore_value = true;
-                        Value::from("")
-                    }
-                }
-                None => {
-                    ignore_value = true;
-                    Value::from("")
-                }
-            };
-
-            if !ignore_value {
-                es_row[&e.0.to_lowercase()] = value;
-            }
-        }
-        es_row["objectid"] = Value::from(feature.fid().unwrap());
-        es_row["the_geom"] =
-            serde_json::from_str(&feature.geometry().json().unwrap().replace("\\\"", "\""))
-                .unwrap();
-
-        body.push([json!(es_row).to_string(), "\n".to_string()].join(""));
-    }
-    body
-}
-
 async fn psql_connect(
     config: &Properties,
 ) -> Result<(Client, Connection<Socket, NoTlsStream>), Error> {
