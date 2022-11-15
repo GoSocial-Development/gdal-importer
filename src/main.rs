@@ -207,7 +207,7 @@ async fn main() {
                 if es_skip && psql_skip {
                     print!("Skipped {}", iterations * chunk_size);
                 } else if time_remaining < 1.0 {
-                    print!("ETA: {:.0?} minutes", time_remaining / 60.0);
+                    print!("ETA: {:.0?} minutes", time_remaining * 60.0);
                 } else {
                     print!("ETA: {:.1?} hours", time_remaining);
                 }
@@ -430,8 +430,10 @@ async fn es_rows(
     index: &str,
     auth: &HashMap<String, String>,
 ) -> Result<i64, anyhow::Error> {
-    let client = reqwest::Client::new();
-    match client
+    match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
         .get([es_host, "/", index, "/_search"].join(""))
         .body(json!({"size": 0}).to_string())
         .basic_auth(
@@ -485,7 +487,7 @@ async fn create_psql_table(
 
     for (key, value) in mapping {
         match value.as_str() {
-            "string" => table_sql.push([key, "VARCHAR ( 250 ),"].join(" ")),
+            "string" => table_sql.push([key, "VARCHAR ( 500 ),"].join(" ")),
             "integer" => table_sql.push([key, "int8,"].join(" ")),
             "double" => table_sql.push([key, "float8,"].join(" ")),
             "date" => table_sql.push([key, "date,"].join(" ")),
@@ -512,8 +514,10 @@ async fn elastic_insert(
     if skip {
         return Ok(true);
     };
-    let client = reqwest::Client::new();
-    match client
+    match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
         .put([es_host, "/_bulk?wait_for_active_shards=0"].join(""))
         .body(body)
         .basic_auth(
@@ -591,8 +595,10 @@ async fn create_elastic_index(
     auth: &HashMap<String, String>,
 ) -> Result<bool, reqwest::Error> {
     let url = [es_host, &index].join("\\");
-    let client = reqwest::Client::new();
-    match client
+    match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
         .delete(&url)
         .basic_auth(
             auth.get("username").unwrap(),
@@ -607,7 +613,10 @@ async fn create_elastic_index(
 
     let data = create_elastic_mapping(&mapping).to_string();
 
-    match client
+    match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
         .put(&url)
         .body(data)
         .basic_auth(
