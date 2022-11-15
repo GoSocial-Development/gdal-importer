@@ -396,9 +396,11 @@ fn process_chunk(
         );
 
         es_row["objectid"] = Value::from(feature.fid().unwrap());
-        es_row["the_geom"] =
-            serde_json::from_str(&feature.geometry().json().unwrap().replace("\\\"", "\""))
-                .unwrap();
+        es_row["the_geom"] = match feature.geometry().json() {
+            Ok(v) => serde_json::from_str(&v.replace("\\\"", "\"")).unwrap(),
+            Err(_e) => serde_json::from_str("{}")
+            .unwrap(),
+        };
 
         body.push([json!(es_row).to_string(), "\n".to_string()].join(""));
 
