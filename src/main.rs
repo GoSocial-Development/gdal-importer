@@ -502,7 +502,16 @@ async fn create_psql_table(
     table_sql.push(")".to_string());
 
     match client.execute(&table_sql.join(" "), &[]).await {
-        Ok(_) => Ok(true),
+        Ok(_) => match client
+            .execute(
+                &["CREATE INDEX the_geom_idx ON ", table, " USING GIST (the_geom)"].join(""),
+                &[],
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     }
 }
