@@ -279,7 +279,7 @@ fn process_chunk(
 ) -> (String, String) {
     let mut body: Vec<String> = Vec::new();
 
-    let mut es_row = json!({});
+    
 
     let mut insert_query = Vec::new();
 
@@ -297,6 +297,7 @@ fn process_chunk(
     let mut insert_values = Vec::new();
 
     for mut feature in features {
+        let mut es_row = json!({});
         if geometry_tolerance > 0 as f64 {
             feature
                 .set_geometry(
@@ -510,7 +511,7 @@ async fn create_psql_table(
             .await
         {
             Ok(_) => Ok(true),
-            Err(e) => Err(e),
+            Err(_e) => Ok(true),
         },
         Err(e) => Err(e),
     }
@@ -652,7 +653,6 @@ fn create_elastic_mapping(mapping: &HashMap<String, String>) -> Value {
     let mut es_mapping = json!({
         "settings": {
             "index": {
-                "refresh_interval": "1s",
                 "number_of_shards": 4,
                 "number_of_replicas": 0,
                 "max_result_window" : 500000000
